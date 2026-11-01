@@ -120,6 +120,7 @@ enum Slot {
     SessionsButton,
     SessionsOfficial,
     SessionsServer,
+    SoloistDownload,
     SoloistBinary,
     SoloistKey,
     Discord,
@@ -928,6 +929,10 @@ impl SettingsView {
             Slot::SessionsButton => (t!("settings-sessions-button"), SharedString::default()),
             Slot::SessionsOfficial => (t!("settings-sessions-official"), SharedString::default()),
             Slot::SessionsServer => (t!("settings-sessions-server"), SharedString::default()),
+            Slot::SoloistDownload => (
+                t!("settings-soloist-download"),
+                t!("settings-soloist-download-detail"),
+            ),
             Slot::SoloistBinary => (
                 t!("settings-soloist-binary"),
                 t!("settings-soloist-binary-detail"),
@@ -1061,6 +1066,7 @@ impl SettingsView {
             Slot::SessionsButton => self.sessions_button_row(cx),
             Slot::SessionsOfficial => self.sessions_official_row(cx),
             Slot::SessionsServer => self.sessions_server_row(cx),
+            Slot::SoloistDownload => self.soloist_download_row(cx),
             Slot::SoloistBinary => self.soloist_binary_row(cx),
             Slot::SoloistKey => self.soloist_key_row(cx),
             Slot::Discord => self.discord_row(cx),

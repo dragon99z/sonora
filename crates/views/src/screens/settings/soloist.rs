@@ -8,6 +8,10 @@ use ui::{Button, Input};
 
 use super::{Group, SOLOIST_APPLY_DELAY, SettingsView, Slot};
 
+/// The page of Spotify's developer site where Soloist is downloaded, which has the latest
+/// version for each platform, and the release notes.
+const SOLOIST_DOWNLOAD: &str = "https://developer.spotify.com/documentation/soloist/reference/downloads-and-updates";
+
 /// The page of Spotify's developer dashboard where a Soloist API key is made.
 const SOLOIST_DASHBOARD: &str = "https://developer.spotify.com/dashboard/soloist";
 
@@ -25,7 +29,7 @@ impl SettingsView {
     pub(super) fn soloist_groups(&self) -> Vec<Group> {
         vec![
             Group::new("settings-group-spotify-soloist", "icons/speaker.svg")
-                .rows([Slot::SoloistBinary, Slot::SoloistKey]),
+                .rows([Slot::SoloistDownload, Slot::SoloistBinary, Slot::SoloistKey]),
         ]
     }
 
@@ -40,6 +44,17 @@ impl SettingsView {
             })
             .ok();
         }));
+    }
+
+    /// The row for the Soloist download link: a button that opens the page where it is downloaded.
+    pub(super) fn soloist_download_row(&self, _cx: &mut Context<Self>) -> AnyElement {
+        let get = Button::new("soloist-download")
+            .label(t!("settings-soloist-download-button"))
+            .icon("icons/external-link.svg")
+            .small()
+            .outline()
+            .on_click(|_, _, cx| cx.open_url(SOLOIST_DOWNLOAD));
+        self.soloist_message_row("settings-soloist-download", get)
     }
 
     /// The row for where Soloist is installed: the field, and a button that opens a file dialog
@@ -116,6 +131,22 @@ impl SettingsView {
                 .items_center()
                 .gap_2()
                 .child(div().w(FIELD_WIDTH).child(field.clone()))
+                .child(button.min_w(BUTTON_WIDTH))
+                .into_any_element(),
+        )
+    }
+
+    fn soloist_message_row(
+        &self,
+        title: &'static str,
+        button: Button,
+    ) -> AnyElement {
+        self.row(
+            i18n::lookup(title, None),
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
                 .child(button.min_w(BUTTON_WIDTH))
                 .into_any_element(),
         )
