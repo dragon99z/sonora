@@ -98,7 +98,7 @@ const RESUME_STEP: Duration = Duration::from_secs(5);
 /// reports the track as ended. Apple's license asks for renewal 13 minutes after it is issued,
 /// and that clock starts at the load rather than the pause, so this leaves room for a long track.
 const STALE_PAUSE: Duration = Duration::from_secs(5 * 60);
-const TAPER_DB: f32 = 50.;
+const TAPER_DB: f32 = music::VOLUME_TAPER_DB;
 const SIMILAR_LIMIT: usize = 20;
 
 /// How few tracks may be left to play before radio asks for the next batch of suggestions.
@@ -2523,6 +2523,20 @@ impl Playback {
         self.settings
             .update(cx, |settings, cx| settings.set_quality(quality, cx));
         self.restart_engine(cx);
+    }
+
+    /// Applies the Soloist executable and API key in the settings. Spotify plays through Soloist
+    /// while there is a key, so when that changes the streaming engine restarts, and the current
+    /// track reloads where it was.
+    pub fn apply_soloist(&mut self, cx: &mut Context<Self>) {
+        let changed = {
+            let settings = self.settings.read(cx);
+            music::set_soloist(settings.soloist_binary(), settings.soloist_api_key())
+        };
+        if changed {
+            log::info!("playback: restarting after the Soloist settings changed");
+            self.restart_engine(cx);
+        }
     }
 
     pub fn set_normalisation(&mut self, on: bool, cx: &mut Context<Self>) {

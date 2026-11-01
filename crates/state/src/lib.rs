@@ -276,6 +276,11 @@ pub fn init(
         settings.read(cx).keep_tracks(),
         vault::bytes(settings.read(cx).cache_gb()),
     );
+    // The same goes for Soloist, which Spotify may play through as soon as it signs in.
+    music::set_soloist(
+        settings.read(cx).soloist_binary(),
+        settings.read(cx).soloist_api_key(),
+    );
     let session =
         cx.new(|cx| Session::new(providers, local_provider, settings.clone(), io.clone(), cx));
     let network = cx.new(|cx| Network::new(session.clone(), settings.clone(), io.clone(), cx));

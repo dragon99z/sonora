@@ -149,6 +149,22 @@ yay -S sonora-nightly-bin
 nix run github:sonorahq/sonora/nightly
 ```
 
+## Spotify accounts that cannot play
+
+Spotify has stopped giving librespot the audio of some newer accounts, which shows as `audio key
+error` in the log. Spotify's own [Soloist](https://developer.spotify.com/documentation/soloist)
+client plays for those accounts, and Sonora can drive it. Sonora does not include or download
+Soloist, so install a build from Spotify yourself (builds expire after 90 days) and generate your
+own Soloist API key on the Spotify for Developers site.
+
+Enter the key, and the path to `soloist` if it is not on your `PATH`, under Spotify Soloist in
+Settings > Providers. Playback switches over a moment after you stop typing, with no restart. The
+environment variables `SONORA_SOLOIST_API_KEY` and `SONORA_SOLOIST_BIN` do the same where a
+setting is left blank, and `SONORA_SOLOIST_NAME` sets the device name. The first time, open the
+Spotify app and pick that device once to pair it. Soloist plays through the system audio output
+on its own, so the equalizer and spectrum do not apply, and downloads are not available while it
+is in use. Whether Spotify's terms allow this use is for you to check.
+
 ## Community
 
 Feel free to join our [Discord](https://discord.gg/a8N8Tx23rV) server and [Matrix](https://matrix.to/#/#sonora:nolight.dev) space.

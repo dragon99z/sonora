@@ -61,6 +61,19 @@ pub use models::{
 pub use output::{Server as SoundServer, missing_bridge};
 pub use spectrum::{Analyzer, Level, Listening, Spectrum, Watch};
 
+/// How many decibels the volume slider spans, from silent at the bottom to full at the top. The
+/// app turns a slider position into a gain with this, and a player with a volume of its own
+/// turns the gain back into the position.
+pub const VOLUME_TAPER_DB: f32 = 50.;
+
+/// Tells Spotify's playback where Spotify's Soloist is installed and which API key to use, each
+/// from the settings, with a blank one left to its environment variable. Spotify plays through
+/// Soloist while there is a key, and through librespot while there is none. It is read when an
+/// engine starts, so a change reaches the next engine, and returns whether it changed which.
+pub fn set_soloist(binary: &str, api_key: &str) -> bool {
+    spotify::set_soloist(binary, api_key)
+}
+
 pub const LOCAL_TRACK_PREFIX: &str = "local:";
 pub const LOCAL_ALBUM_PREFIX: &str = "local-album:";
 pub const LOCAL_ARTIST_PREFIX: &str = "local-artist:";

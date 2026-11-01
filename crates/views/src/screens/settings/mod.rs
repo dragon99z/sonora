@@ -40,6 +40,7 @@ mod preview;
 mod rows;
 mod scrobbling;
 mod sessions;
+mod soloist;
 mod sound;
 mod storage;
 mod themes;
@@ -58,6 +59,8 @@ const LANGUAGES: &str = "languages";
 const TYPEFACES: &str = "typefaces";
 /// How often the storage section measures the cache and the downloads again while its tab shows.
 const STORAGE_POLL: Duration = Duration::from_secs(2);
+/// How long the Soloist fields must be left alone before the app switches to what they say.
+const SOLOIST_APPLY_DELAY: Duration = Duration::from_millis(900);
 
 /// One setting, named without building anything. Pages list their settings as slots in groups,
 /// a search scores slots by their title and detail, and only visible groups build their rows.
@@ -117,6 +120,8 @@ enum Slot {
     SessionsButton,
     SessionsOfficial,
     SessionsServer,
+    SoloistBinary,
+    SoloistKey,
     Discord,
     DiscordName,
     DiscordShowPaused,
@@ -266,6 +271,12 @@ pub struct SettingsView {
     connect_name: Entity<Input>,
     /// The address of the listener's own Sonora Sessions server.
     sessions_server: Entity<Input>,
+    /// The field for where Spotify's Soloist is installed.
+    soloist_binary: Entity<Input>,
+    /// The masked field for the listener's Soloist API key.
+    soloist_key: Entity<Input>,
+    /// Waits for typing in the Soloist fields to stop before they are applied.
+    soloist_apply: Option<Task<()>>,
     /// The service whose link dialog is open, by slug.
     scrobble_prompt: Option<&'static str>,
     /// The provider whose sign-in choice is up, by slug and name.
@@ -401,6 +412,30 @@ impl SettingsView {
         // what is typed is kept only once the Save button finds its server answers
         cx.observe(&sessions_server, |_, _, cx| cx.notify())
             .detach();
+        let soloist_binary = cx.new(|cx| Input::new("settings-soloist-binary-hint", cx).compact());
+        let saved = settings.read(cx).soloist_binary().to_owned();
+        soloist_binary.update(cx, |input, cx| input.set_text(saved, cx));
+        cx.observe(&soloist_binary, |this, input, cx| {
+            let text = input.read(cx).text().to_owned();
+            this.settings
+                .update(cx, |settings, cx| settings.set_soloist_binary(text, cx));
+            this.schedule_soloist(cx);
+        })
+        .detach();
+
+        let soloist_key = cx.new(|cx| Input::new("settings-soloist-key-hint", cx).compact());
+        let saved = settings.read(cx).soloist_api_key().to_owned();
+        soloist_key.update(cx, |input, cx| {
+            input.set_masked(true, cx);
+            input.set_text(saved, cx);
+        });
+        cx.observe(&soloist_key, |this, input, cx| {
+            let text = input.read(cx).text().to_owned();
+            this.settings
+                .update(cx, |settings, cx| settings.set_soloist_api_key(text, cx));
+            this.schedule_soloist(cx);
+        })
+        .detach();
 
         let popovers = Popovers::default();
         let output_picker = cx.new(|cx| OutputPicker::new(outputs.clone(), popovers.clone(), cx));
@@ -447,6 +482,9 @@ impl SettingsView {
             scrobble_second: cx.new(|cx| Input::new("settings-scrobble-secret", cx)),
             connect_name,
             sessions_server,
+            soloist_binary,
+            soloist_key,
+            soloist_apply: None,
             scrobble_prompt: None,
             languages,
             typefaces,
@@ -890,6 +928,14 @@ impl SettingsView {
             Slot::SessionsButton => (t!("settings-sessions-button"), SharedString::default()),
             Slot::SessionsOfficial => (t!("settings-sessions-official"), SharedString::default()),
             Slot::SessionsServer => (t!("settings-sessions-server"), SharedString::default()),
+            Slot::SoloistBinary => (
+                t!("settings-soloist-binary"),
+                t!("settings-soloist-binary-detail"),
+            ),
+            Slot::SoloistKey => (
+                t!("settings-soloist-key"),
+                t!("settings-soloist-key-detail"),
+            ),
             Slot::Discord => (t!("settings-discord"), t!("settings-discord-detail")),
             Slot::DiscordName => (
                 t!("settings-discord-name"),
@@ -1015,6 +1061,8 @@ impl SettingsView {
             Slot::SessionsButton => self.sessions_button_row(cx),
             Slot::SessionsOfficial => self.sessions_official_row(cx),
             Slot::SessionsServer => self.sessions_server_row(cx),
+            Slot::SoloistBinary => self.soloist_binary_row(cx),
+            Slot::SoloistKey => self.soloist_key_row(cx),
             Slot::Discord => self.discord_row(cx),
             Slot::DiscordName => self.discord_name_row(cx),
             Slot::DiscordShowPaused => self.discord_show_paused_row(cx),

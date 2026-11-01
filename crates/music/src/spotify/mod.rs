@@ -18,6 +18,7 @@ mod profiles;
 mod radio;
 mod search;
 mod sink;
+mod soloist;
 mod wire;
 
 use std::sync::Arc;
@@ -34,6 +35,7 @@ use crate::{
 pub use auth::AuthConfig;
 pub use client::LibrespotClient;
 pub use lyrics::SpotifyLyrics;
+pub use soloist::{SoloistConfig, set as set_soloist};
 
 pub struct SpotifyProvider {
     config: AuthConfig,
@@ -60,21 +62,70 @@ impl SpotifyProvider {
 
     async fn session(&self, client: LibrespotClient) -> Result<ProviderSession> {
         let profile = client.profile().await?;
-        let playback = Arc::new(Factory::new(client.session().clone()));
+        let (playback, capabilities) = self.playback(&client);
         Ok(ProviderSession {
             profile,
             api: Arc::new(client),
             playback,
             shape: Shape::Saved,
             authenticated: true,
-            capabilities: Capabilities {
+            capabilities,
+        })
+    }
+
+    /// The engine tracks play through, and what it leaves the app to offer. Soloist decodes and
+    /// plays by itself at a quality it chooses, and keeps no downloads for Sonora, so those are
+    /// not offered while it plays. Whether it plays is read again each time an engine starts, so
+    /// the settings can change it while the app runs, but what is offered is settled here.
+    fn playback(&self, client: &LibrespotClient) -> (Arc<dyn PlaybackFactory>, Capabilities) {
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        let capabilities = match soloist::current().is_some() && runtime.is_some() {
+            true => Capabilities {
+                pins: true,
+                keeps: false,
+                downloads: false,
+                ..Capabilities::ALL
+            },
+            false => Capabilities {
                 pins: true,
                 playlist_covers: true,
                 download_gap: playback::DOWNLOAD_GAP,
                 qualities: playback::QUALITIES,
                 ..Capabilities::ALL
             },
-        })
+        };
+        let factory = Switch {
+            librespot: Factory::new(client.session().clone()),
+            runtime,
+        };
+        (Arc::new(factory), capabilities)
+    }
+}
+
+/// Starts the engine Spotify plays through: Soloist while the settings or the environment give it
+/// an API key, librespot otherwise. It decides at each start rather than once, so a setting that
+/// changes while the app runs reaches the next engine.
+struct Switch {
+    librespot: Factory,
+    /// What Soloist is run on. Without one it cannot be started, and librespot plays.
+    runtime: Option<tokio::runtime::Handle>,
+}
+
+impl PlaybackFactory for Switch {
+    fn start(
+        &self,
+        config: crate::PlaybackConfig,
+    ) -> (Box<dyn crate::Player>, Box<dyn crate::PlaybackEvents>) {
+        match (soloist::current(), &self.runtime) {
+            (Some(soloist), Some(runtime)) => {
+                log::info!(
+                    "spotify: playing through Soloist ({})",
+                    soloist.binary.display()
+                );
+                soloist::Factory::new(soloist, runtime.clone()).start(config)
+            }
+            _ => self.librespot.start(config),
+        }
     }
 }
 

@@ -188,6 +188,9 @@ struct Worker {
     rename_at: Option<Instant>,
     /// The device that has playback on the account, as the last cluster said.
     active_device: String,
+    /// Whether that device is the Soloist that plays for this app, which is this app's own
+    /// output and not another device that has taken playback.
+    bridged: bool,
     /// Last queue published by another active device, retained across a transfer here.
     remote_queue: Option<(Arc<Snapshot>, Instant)>,
     /// The reason of a put that is due but held back, and when it may go out.
@@ -219,6 +222,7 @@ impl Worker {
             last_command: (0, String::new()),
             ack_at: None,
             rename_at: None,
+            bridged: false,
             active_device: String::new(),
             remote_queue: None,
             pending: None,
@@ -510,9 +514,14 @@ impl Worker {
     /// ends, and hands it on from itself, or from whichever device the last cluster named.
     async fn transfer(&mut self, to: String) {
         let mine = self.session.device_id().to_owned();
+        // Soloist has playback for this app, so it is here already, and it is what a move to
+        // another device has to be made from.
+        if to == mine && self.bridged {
+            return;
+        }
         let from = match (
             to == mine,
-            self.active_since.is_some(),
+            self.active_since.is_some() && !self.bridged,
             self.active_device.is_empty(),
         ) {
             // playback is here already
@@ -640,6 +649,7 @@ impl Worker {
             return;
         };
         self.active_device = cluster.active_device_id.clone();
+        self.bridged = plays_through_soloist(&cluster);
         let roster = self.roster(&cluster);
         let elsewhere = match roster.elsewhere.is_some() {
             true => "playback on another device",
@@ -788,7 +798,9 @@ impl Worker {
         PutStateRequest {
             member_type: EnumOrUnknown::new(MemberType::CONNECT_STATE),
             put_state_reason: EnumOrUnknown::new(reason),
-            is_active: self.active_since.is_some() && self.now.is_some(),
+            // While Soloist plays for this app it is the device that has playback, and claiming
+            // it here would take playback from it and leave it silent.
+            is_active: self.active_since.is_some() && self.now.is_some() && !soloist_plays(),
             started_playing_at: self.active_since.map(millis).unwrap_or_default(),
             client_side_timestamp: stamp,
             last_command_message_id: self.last_command.0,
@@ -889,7 +901,10 @@ impl Worker {
             return;
         };
         let mine = self.session.device_id();
-        let elsewhere = !cluster.active_device_id.is_empty() && cluster.active_device_id != mine;
+        self.bridged = plays_through_soloist(cluster);
+        let elsewhere = !cluster.active_device_id.is_empty()
+            && cluster.active_device_id != mine
+            && !self.bridged;
         let fresh = self
             .claimed_at
             .is_none_or(|claimed| claimed.elapsed() > CLAIM_GRACE);
@@ -940,7 +955,12 @@ impl Worker {
         let mut devices = cluster
             .device
             .iter()
-            .filter(|(id, info)| id.as_str() != mine && info.can_play && !info.capabilities.hidden)
+            .filter(|(id, info)| {
+                id.as_str() != mine
+                    && info.can_play
+                    && !info.capabilities.hidden
+                    && !is_soloist(&info.name)
+            })
             .map(|(id, info)| known(id, info))
             .collect::<Vec<_>>();
         devices.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
@@ -948,7 +968,7 @@ impl Worker {
         let elsewhere = cluster
             .device
             .get(&cluster.active_device_id)
-            .filter(|_| cluster.active_device_id != mine)
+            .filter(|info| cluster.active_device_id != mine && !is_soloist(&info.name))
             .map(|info| {
                 let state = &cluster.player_state;
                 let millis = |value: i64| Duration::from_millis(value.max(0) as u64);
@@ -1486,6 +1506,25 @@ fn collection_uri(collection: &Collection, username: &str) -> String {
         Collection::Saved => format!("spotify:user:{username}:collection"),
         Collection::Radio(id) => format!("spotify:station:track:{id}"),
     }
+}
+
+/// Whether Spotify plays through Soloist for this app now.
+fn soloist_plays() -> bool {
+    super::soloist::current().is_some()
+}
+
+/// Whether a device of that name is the Soloist that plays for this app. It is listed on the
+/// account as a device of its own, but it is this app's output rather than another device.
+fn is_soloist(name: &str) -> bool {
+    super::soloist::current().is_some_and(|soloist| soloist.device_name == name)
+}
+
+/// Whether the device with playback is the Soloist that plays for this app.
+fn plays_through_soloist(cluster: &Cluster) -> bool {
+    cluster
+        .device
+        .get(&cluster.active_device_id)
+        .is_some_and(|info| is_soloist(&info.name))
 }
 
 fn kind(info: &DeviceInfo) -> DeviceKind {

@@ -16,6 +16,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   each track's own sample rate on Linux and macOS.
 - Swipe two fingers sideways on a touchpad to go back or forward a page.
 - A quick flick on a touchpad under Wayland keeps the page scrolling for a moment after your fingers lift.
+- Spotify can play through Spotify's own Soloist client, for accounts that librespot can no longer
+  get audio for. Turn it on with your Soloist API key under Spotify Soloist in Settings > Providers.
 
 ### Changed
 

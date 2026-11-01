@@ -378,6 +378,10 @@ struct Values {
     sessions_official: bool,
     /// The WebSocket address of the Sonora Sessions server to use instead of the official one.
     sessions_server: String,
+    /// Where Spotify's Soloist is installed. Empty looks for `soloist` on the `PATH`.
+    soloist_binary: String,
+    /// The listener's own Soloist API key. Playing through Soloist is on while it is set.
+    soloist_api_key: String,
     discord_presence: bool,
     discord_name: DiscordName,
     discord_show_paused: bool,
@@ -598,6 +602,8 @@ impl Default for Values {
             sessions_button: true,
             sessions_official: true,
             sessions_server: String::new(),
+            soloist_binary: String::new(),
+            soloist_api_key: String::new(),
             discord_presence: false,
             discord_name: DiscordName::Sonora,
             discord_show_paused: false,
@@ -1002,6 +1008,16 @@ impl AppSettings {
     /// The address of the server to use instead of the official one, as typed.
     pub fn sessions_server(&self) -> &str {
         &self.values.sessions_server
+    }
+
+    /// Where Spotify's Soloist is installed, as typed. Empty means `soloist` on the `PATH`.
+    pub fn soloist_binary(&self) -> &str {
+        &self.values.soloist_binary
+    }
+
+    /// The Soloist API key, as typed. Spotify plays through Soloist while it is not empty.
+    pub fn soloist_api_key(&self) -> &str {
+        &self.values.soloist_api_key
     }
 
     /// Whether the playing track is published to a local Discord client.
@@ -1598,6 +1614,22 @@ impl AppSettings {
             return;
         }
         self.values.sessions_server = server;
+        self.schedule_save(cx);
+    }
+
+    pub fn set_soloist_binary(&mut self, binary: String, cx: &mut Context<Self>) {
+        if self.values.soloist_binary == binary {
+            return;
+        }
+        self.values.soloist_binary = binary;
+        self.schedule_save(cx);
+    }
+
+    pub fn set_soloist_api_key(&mut self, key: String, cx: &mut Context<Self>) {
+        if self.values.soloist_api_key == key {
+            return;
+        }
+        self.values.soloist_api_key = key;
         self.schedule_save(cx);
     }
 

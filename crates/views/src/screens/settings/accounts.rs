@@ -74,6 +74,9 @@ impl SettingsView {
             Group::new("settings-group-local-files", "icons/file-music.svg")
                 .rows([Slot::LocalFolder]),
         ]
+        .into_iter()
+        .chain(self.soloist_groups())
+        .collect()
     }
 
     pub(super) fn music_folders_groups(&self) -> Vec<Group> {
