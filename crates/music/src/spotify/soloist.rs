@@ -10,16 +10,17 @@
 //! equalizer, spectrum or downloads. Sonora neither bundles nor downloads Soloist: the listener
 //! installs a build from Spotify and gives Sonora its path and their own API key.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
 use futures::{SinkExt as _, StreamExt as _};
 use serde::Deserialize;
-use tokio::io::{AsyncBufReadExt as _, BufReader};
+use tokio::io::{AsyncBufReadExt as _, AsyncRead, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::runtime::Handle;
@@ -27,7 +28,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::{PlaybackConfig, PlaybackEvent, PlaybackEvents, PlaybackFactory, Player};
+use crate::{Fault, PlaybackConfig, PlaybackEvent, PlaybackEvents, PlaybackFactory, Player};
 
 const TRACK_PREFIX: &str = "spotify:track:";
 const API_KEY_VAR: &str = "SONORA_SOLOIST_API_KEY";
@@ -36,8 +37,29 @@ const NAME_VAR: &str = "SONORA_SOLOIST_NAME";
 /// The name Soloist shows in Spotify's apps. It differs from the `Sonora` that the Connect
 /// worker uses, so the two are never mistaken for one another in a device list.
 const DEFAULT_DEVICE_NAME: &str = "Sonora (Soloist)";
+/// How long Soloist is left alone after it signs in because the listener picked it in Spotify,
+/// which starts the song it had on the device and moves playback to it, before it is taken back.
+const RECLAIM_SETTLE: Duration = Duration::from_millis(1500);
+/// How long Soloist is given to give up the active device before it is made active again.
+const RECLAIM_GAP: Duration = Duration::from_millis(700);
+/// How long after one Soloist has gone the next may be started. Both restore the same saved login,
+/// and one that is restored while the last is only just gone has been refused.
+const SETTLE: Duration = Duration::from_secs(1);
+/// How many of Soloist's last lines are kept to say what went wrong when something does.
+const TAIL: usize = 50;
+/// How long after Soloist goes away its last lines are given to arrive.
+const TAIL_SETTLE: Duration = Duration::from_millis(150);
 /// Soloist's exit code when its build has passed its 90 days.
 const EXPIRED: i32 = 10;
+/// Soloist's exit code when it cannot take the data directory, which is what a Soloist left
+/// running by an earlier Sonora, or by a crash, makes it do.
+const ORPHANED: i32 = 1;
+/// How long a track waits for a Soloist that asked to be signed in, which the listener does by
+/// picking its device in the Spotify app. The track plays as soon as that is done.
+const SIGNIN_WAIT: Duration = Duration::from_secs(60);
+/// How long an error line from Soloist is held back, since the line that explains it, a rejected
+/// API key say, follows within moments and is the one to tell the listener of.
+const ERROR_SETTLE: Duration = Duration::from_millis(400);
 /// How long a started Soloist has to publish where its WebSocket API listens.
 const START_WAIT: Duration = Duration::from_secs(15);
 const START_POLL: Duration = Duration::from_millis(100);
@@ -371,6 +393,7 @@ enum Out {
     Seek(u64),
     Volume(u8),
     Activate,
+    Deactivate,
     GetState,
 }
 
@@ -388,10 +411,20 @@ impl Out {
                 json!({ "type": "command", "command": "set_volume", "volume": volume })
             }
             Self::Activate => json!({ "type": "command", "command": "activate" }),
+            Self::Deactivate => json!({ "type": "command", "command": "deactivate" }),
             Self::GetState => json!({ "type": "command", "command": "get_state" }),
         };
         value.to_string()
     }
+}
+
+/// Taking Soloist back after the Spotify app that signed it in has started its own song on it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Reclaim {
+    /// Waiting for what the app does to settle, until then.
+    Settle(Instant),
+    /// Soloist was told to give up the active device, and is made active again at then.
+    Reactivate(Instant),
 }
 
 /// What the tracker decides: a command to send Soloist, or an event for the app.
@@ -428,13 +461,15 @@ struct Wanted {
     /// A seek that waits for Soloist to allow it, and the time after which it is sent anyway.
     pending_seek: Option<PendingSeek>,
     seek_until: Option<Instant>,
+    /// The seek last sent, to send again if Soloist turns out not to have allowed it yet.
+    last_seek: Option<PendingSeek>,
     /// When the track is given up as unavailable if Soloist has not reported it by then.
     deadline: Option<Instant>,
 }
 
 /// A seek not yet sent. `report` is whether the app asked for it, and so is told when it is done:
 /// the seek that puts a track at its starting place is not the app's.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 struct PendingSeek {
     at: Duration,
     report: bool,
@@ -444,6 +479,7 @@ impl Wanted {
     /// Takes the waiting seek as the command that sends it, starting the clock on reporting it.
     fn take_seek(&mut self, now: Instant) -> Option<Action> {
         let seek = self.pending_seek.take()?;
+        self.last_seek = Some(seek);
         self.seek_until = None;
         if seek.report {
             self.seeking = Some((seek.at, now + SEEK_WAIT));
@@ -467,6 +503,17 @@ struct Tracker {
     anchor: Option<Anchor>,
     wanted: Option<Wanted>,
     volume: u8,
+    /// Soloist said it waits for a login, and the listener has been told to pick it in Spotify.
+    login_prompted: bool,
+    /// Soloist said its API key is not valid, and the listener has been told.
+    key_rejected: bool,
+    /// The first error line Soloist printed that has not been told yet, and when.
+    error_seen: Option<(Instant, String)>,
+    /// An error line of Soloist's has been told to the listener already.
+    error_reported: bool,
+    /// Soloist waited for the listener to pick it in Spotify, so its next login is theirs.
+    paired_by_user: bool,
+    reclaim: Option<Reclaim>,
 }
 
 impl Tracker {
@@ -481,7 +528,99 @@ impl Tracker {
             anchor: None,
             wanted: None,
             volume: percent(gain),
+            login_prompted: false,
+            key_rejected: false,
+            error_seen: None,
+            error_reported: false,
+            paired_by_user: false,
+            reclaim: None,
         }
+    }
+
+    /// Plays the track that was waiting for Soloist to be ready, if there is one.
+    fn replay(&mut self, now: Instant, out: &mut Vec<Action>) {
+        if self
+            .wanted
+            .as_ref()
+            .is_some_and(|wanted| !wanted.sent && !wanted.done)
+        {
+            self.send_play(now, out);
+        }
+    }
+
+    /// Gives up on the track that is still starting, which fails it now rather than when its
+    /// time runs out.
+    fn give_up(&mut self) -> Vec<Action> {
+        let mut out = Vec::new();
+        if let Some(wanted) = self
+            .wanted
+            .as_mut()
+            .filter(|wanted| !wanted.seen && !wanted.done)
+        {
+            wanted.done = true;
+            wanted.deadline = None;
+            out.push(Action::Emit(PlaybackEvent::Unavailable {
+                id: Some(wanted.id.clone()),
+            }));
+        }
+        out
+    }
+
+    /// A line Soloist printed. It says why it will not sign in or play only in its log, so the
+    /// lines that explain are read here and the rest are left to the log.
+    fn on_line(&mut self, line: &str, now: Instant) -> Vec<Action> {
+        let mut out = Vec::new();
+        let Some((level, message)) = read_line(line) else {
+            return out;
+        };
+        let lower = message.to_lowercase();
+        if lower.contains("-> logging_in") {
+            // A login is under way, from a restored session or from the listener picking the
+            // device, so what was said of the last one no longer holds.
+            self.key_rejected = false;
+            self.login_prompted = false;
+        } else if lower.contains("--api-key") || lower.contains("oauth_invalid_credentials") {
+            if !std::mem::replace(&mut self.key_rejected, true) {
+                log::warn!("playback: soloist does not accept the API key: {message}");
+                out.push(Action::Emit(fault(Fault::InvalidKey)));
+                out.extend(self.give_up());
+            }
+        } else if lower.starts_with("waiting for login") {
+            if !self.key_rejected && !std::mem::replace(&mut self.login_prompted, true) {
+                log::warn!(
+                    "playback: soloist waits for a login; open Spotify and pick the device \
+                     {:?} to pair it",
+                    self.device
+                );
+                out.push(Action::Emit(fault(Fault::NotSignedIn(self.device.clone()))));
+                self.paired_by_user = true;
+                // The listener has to do something, so the track is left waiting for them.
+                if let Some(wanted) = self
+                    .wanted
+                    .as_mut()
+                    .filter(|wanted| !wanted.seen && !wanted.done)
+                {
+                    wanted.deadline = Some(now + SIGNIN_WAIT);
+                }
+            }
+        } else if level == 'E' && !self.key_rejected && self.error_seen.is_none() {
+            self.error_seen = Some((now, message.to_owned()));
+        }
+        out
+    }
+
+    /// The load to make again on a fresh Soloist, if the track was still starting when this one
+    /// went away.
+    fn retry_order(&self) -> Option<Order> {
+        let wanted = self
+            .wanted
+            .as_ref()
+            .filter(|wanted| !wanted.seen && !wanted.done)?;
+        Some(Order::Load {
+            id: wanted.id.clone(),
+            at: wanted.at,
+            paused: wanted.hold,
+        })
     }
 
     /// The app's commands.
@@ -510,10 +649,21 @@ impl Tracker {
                     seeking: None,
                     pending_seek: None,
                     seek_until: None,
+                    last_seek: None,
                     deadline: Some(now + LOAD_WAIT),
                 });
                 match self.logged_in {
                     true => self.send_play(now, &mut out),
+                    // A Soloist that has said it cannot be used is not waited on again, since
+                    // nothing has changed. The listener is told again, and the track fails.
+                    false if self.key_rejected => {
+                        out.push(Action::Emit(fault(Fault::InvalidKey)));
+                        out.extend(self.give_up());
+                    }
+                    false if self.login_prompted => {
+                        out.push(Action::Emit(fault(Fault::NotSignedIn(self.device.clone()))));
+                        out.extend(self.give_up());
+                    }
                     false => log::info!(
                         "playback: soloist is not signed in yet, so it is waiting; if this \
                          lasts, open Spotify and pick the device {:?} once to pair it",
@@ -570,12 +720,11 @@ impl Tracker {
                 if logged_in && !was {
                     log::info!("playback: soloist is signed in");
                     out.push(Action::Send(Out::Volume(self.volume)));
-                    if self
-                        .wanted
-                        .as_ref()
-                        .is_some_and(|wanted| !wanted.sent && !wanted.done)
-                    {
-                        self.send_play(now, &mut out);
+                    match std::mem::take(&mut self.paired_by_user) {
+                        // The app that signed Soloist in starts its own song on it at once,
+                        // which a track asked for at the same moment gets lost in.
+                        true => self.reclaim = Some(Reclaim::Settle(now + RECLAIM_SETTLE)),
+                        false => self.replay(now, &mut out),
                     }
                 }
             }
@@ -624,8 +773,24 @@ impl Tracker {
                 }
             }
             Incoming::DeviceChanged { is_active } => self.active = is_active,
+            // Soloist refuses a command for now while it is between tracks, which it says is
+            // restricted. That passes, so it is not told to the listener and the track is not
+            // given up on. A seek it refused is put back to be sent when it is allowed.
+            Incoming::Error { message } if message.to_lowercase().contains("restricted") => {
+                log::info!("playback: soloist refused a command for now: {message}");
+                if message.to_lowercase().contains("seek_to_restricted") {
+                    self.can_seek = false;
+                    if let Some(wanted) = self.wanted.as_mut().filter(|wanted| !wanted.done)
+                        && let Some(seek) = wanted.last_seek.take()
+                    {
+                        wanted.pending_seek = Some(seek);
+                        wanted.seek_until = Some(now + SEEK_PATIENCE);
+                    }
+                }
+            }
             Incoming::Error { message } => {
                 log::warn!("playback: soloist reports an error: {message}");
+                out.push(Action::Emit(fault(Fault::Reported(message))));
                 if let Some(wanted) = self
                     .wanted
                     .as_mut()
@@ -647,6 +812,41 @@ impl Tracker {
     /// answered, ends a track that ran out unannounced and gives up on one that never started.
     fn on_tick(&mut self, now: Instant, epoch_ms: u64) -> Vec<Action> {
         let mut out = Vec::new();
+        if self
+            .error_seen
+            .as_ref()
+            .is_some_and(|(at, _)| now.duration_since(*at) >= ERROR_SETTLE)
+        {
+            if let Some((_, message)) = self.error_seen.take()
+                && !self.key_rejected
+                && !std::mem::replace(&mut self.error_reported, true)
+            {
+                log::warn!("playback: soloist reports an error: {message}");
+                out.push(Action::Emit(fault(Fault::Reported(message))));
+            }
+        }
+        match self.reclaim {
+            Some(Reclaim::Settle(at)) if now >= at => match self.active {
+                true => {
+                    log::info!(
+                        "playback: the app that signed soloist in made it the active device, so \
+                         that is given up before playing here"
+                    );
+                    out.push(Action::Send(Out::Deactivate));
+                    self.reclaim = Some(Reclaim::Reactivate(now + RECLAIM_GAP));
+                }
+                false => {
+                    self.reclaim = None;
+                    self.replay(now, &mut out);
+                }
+            },
+            Some(Reclaim::Reactivate(at)) if now >= at => {
+                self.reclaim = None;
+                self.active = false;
+                self.replay(now, &mut out);
+            }
+            _ => {}
+        }
         let Self {
             wanted,
             anchor,
@@ -663,11 +863,17 @@ impl Tracker {
         if !wanted.seen {
             if wanted.deadline.is_some_and(|deadline| now >= deadline) {
                 match logged_in {
-                    true => log::warn!("playback: soloist never started {}", wanted.uri),
-                    false => log::warn!(
-                        "playback: soloist is not signed in; open Spotify and pick the device \
-                         {device:?} to pair it"
-                    ),
+                    true => {
+                        log::warn!("playback: soloist never started {}", wanted.uri);
+                        out.push(Action::Emit(fault(Fault::NeverStarted)));
+                    }
+                    false => {
+                        log::warn!(
+                            "playback: soloist is not signed in; open Spotify and pick the \
+                             device {device:?} to pair it"
+                        );
+                        out.push(Action::Emit(fault(Fault::NotSignedIn(device.clone()))));
+                    }
                 }
                 wanted.done = true;
                 wanted.deadline = None;
@@ -766,6 +972,9 @@ impl Tracker {
         let Some(wanted) = self.wanted.as_mut() else {
             return;
         };
+        // What was allowed of the track before says nothing of the one Soloist is about to load,
+        // which it may be doing again for the very same track.
+        self.can_seek = false;
         if !self.active {
             out.push(Action::Send(Out::Activate));
         }
@@ -917,30 +1126,206 @@ fn epoch_ms() -> u64 {
 
 type Socket = tokio_tungstenite::WebSocketStream<TcpStream>;
 
+/// Held by the engine that has a Soloist running, so a new engine waits for the old one's Soloist
+/// to be gone before it starts its own, as engines are swapped when a setting changes.
+static HOST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// When the last Soloist this app ran went away.
+static LAST_END: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// Waits until no other engine has a Soloist running, and a moment after the last one went.
+async fn host() -> tokio::sync::MutexGuard<'static, ()> {
+    let guard = HOST.lock().await;
+    let ended = *LAST_END.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(ended) = ended {
+        let wait = SETTLE.saturating_sub(ended.elapsed());
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+    }
+    guard
+}
+
+/// What Soloist printed last, oldest first, with the API key taken out.
+type Tail = Arc<Mutex<VecDeque<String>>>;
+
 /// A running Soloist and the socket to it. Dropping it stops the process.
 struct Daemon {
     child: Child,
     socket: Socket,
+    tail: Tail,
+    /// What Soloist prints, line by line, as it does.
+    lines: UnboundedReceiver<String>,
+    /// Where its WebSocket API listens.
+    endpoint: String,
+    key: HostKey,
+}
+
+/// What a Soloist was started with, so one that is already running is used again only when a new
+/// one would have been started the same way.
+#[derive(Clone, PartialEq, Eq)]
+struct HostKey {
+    binary: PathBuf,
+    api_key: String,
+    device_name: String,
+    data_dir: PathBuf,
+    cache_dir: PathBuf,
+}
+
+impl HostKey {
+    fn of(config: &SoloistConfig) -> Self {
+        Self {
+            binary: config.binary.clone(),
+            api_key: config.api_key.clone(),
+            device_name: config.device_name.clone(),
+            data_dir: config.data_dir.clone(),
+            cache_dir: config.cache_dir.clone(),
+        }
+    }
+}
+
+/// A Soloist left running when its engine went away, without the socket to it.
+struct Host {
+    child: Child,
+    tail: Tail,
+    lines: UnboundedReceiver<String>,
+    endpoint: String,
+    key: HostKey,
+}
+
+/// What the next engine asks of the Soloist that was left running.
+enum Ask {
+    /// To have it.
+    Take(tokio::sync::oneshot::Sender<Host>),
+    /// To have it stopped, and to be told once it has.
+    Stop(tokio::sync::oneshot::Sender<()>),
+}
+
+/// The Soloist left running, if there is one, and how to ask for it.
+struct Parked {
+    key: HostKey,
+    ask: tokio::sync::oneshot::Sender<Ask>,
+}
+
+/// An engine is swapped for a new one when a setting changes, and a Soloist that is started
+/// again within seconds of the last has had its saved login refused. So the Soloist outlives its
+/// engine, and the next engine takes it over instead of starting its own.
+static PARKED: Mutex<Option<Parked>> = Mutex::new(None);
+/// How long a Soloist is left running with no engine to use it before it is stopped.
+const PARK_FOR: Duration = Duration::from_secs(600);
+
+/// Leaves `host` running for the next engine, in a task that owns it, so it is stopped with the
+/// runtime when the app quits, and after a while if no engine wants it.
+fn park(host: Host) {
+    let (ask, asked) = tokio::sync::oneshot::channel::<Ask>();
+    *PARKED.lock().unwrap_or_else(PoisonError::into_inner) = Some(Parked {
+        key: host.key.clone(),
+        ask,
+    });
+    tokio::spawn(async move {
+        let mut host = host;
+        tokio::select! {
+            asked = asked => match asked {
+                Ok(Ask::Take(reply)) => {
+                    reply.send(host).ok();
+                }
+                Ok(Ask::Stop(done)) => {
+                    host.child.kill().await.ok();
+                    done.send(()).ok();
+                }
+                // Another Soloist was left in its place, so nothing will ask for this one.
+                Err(_) => {
+                    host.child.kill().await.ok();
+                }
+            },
+            _ = tokio::time::sleep(PARK_FOR) => {
+                log::info!("playback: stopping the soloist nothing has used for a while");
+                host.child.kill().await.ok();
+            }
+        }
+    });
+}
+
+/// Takes over the Soloist that was left running, if it is still running and was started the way
+/// `config` says, and connects to it afresh, which has it say whether it is signed in.
+async fn adopt(config: &SoloistConfig) -> Option<Daemon> {
+    let parked = PARKED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()?;
+    if parked.key != HostKey::of(config) {
+        log::info!("playback: the soloist left running was started otherwise, so it is stopped");
+        let (done, stopped) = tokio::sync::oneshot::channel();
+        if parked.ask.send(Ask::Stop(done)).is_ok() {
+            stopped.await.ok();
+        }
+        return None;
+    }
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    parked.ask.send(Ask::Take(reply)).ok()?;
+    let mut host = answer.await.ok()?;
+    if host
+        .child
+        .try_wait()
+        .map_or(true, |status| status.is_some())
+    {
+        return None;
+    }
+    let stream = TcpStream::connect(&host.endpoint).await.ok()?;
+    let (socket, _) = tokio_tungstenite::client_async(format!("ws://{}", host.endpoint), stream)
+        .await
+        .ok()?;
+    // What it printed while no one was reading is old news.
+    while host.lines.try_recv().is_ok() {}
+    log::info!("playback: using the soloist that is already running");
+    Some(Daemon {
+        child: host.child,
+        socket,
+        tail: host.tail,
+        lines: host.lines,
+        endpoint: host.endpoint,
+        key: host.key,
+    })
+}
+
+/// Why Soloist could not be started, and the last thing it said about it.
+struct Failed {
+    error: anyhow::Error,
+    said: Option<String>,
 }
 
 impl Daemon {
-    async fn start(config: &SoloistConfig, volume: u8) -> Result<Self> {
+    async fn start(config: &SoloistConfig, volume: u8) -> Result<Self, Failed> {
+        if let Some(daemon) = adopt(config).await {
+            return Ok(daemon);
+        }
+        let tail = Tail::default();
         let mut last = anyhow!("soloist was not started");
         for attempt in 0..START_TRIES {
             if attempt > 0 {
                 tokio::time::sleep(START_RETRY).await;
             }
-            match Self::try_start(config, volume).await {
+            tail.lock().unwrap_or_else(PoisonError::into_inner).clear();
+            match Self::try_start(config, volume, &tail).await {
                 Ok(daemon) => return Ok(daemon),
                 // An expired build or a missing executable does not get better by waiting.
-                Err(error) if error.downcast_ref::<Fatal>().is_some() => return Err(error),
-                Err(error) => last = error,
+                Err(error) if error.downcast_ref::<Fatal>().is_some() => {
+                    return Err(Failed::new(error, &tail).await);
+                }
+                Err(error) => {
+                    // A Soloist that exits at once usually found another one holding its data
+                    // directory, which one left running by an earlier Sonora does.
+                    if matches!(error.downcast_ref::<Exit>(), Some(Exit(Some(ORPHANED)))) {
+                        let stopped = kill_orphans(config).await;
+                        log::warn!("playback: soloist exited at once, stopped {stopped} orphan(s)");
+                    }
+                    last = error;
+                }
             }
         }
-        Err(last)
+        Err(Failed::new(last, &tail).await)
     }
 
-    async fn try_start(config: &SoloistConfig, volume: u8) -> Result<Self> {
+    async fn try_start(config: &SoloistConfig, volume: u8, tail: &Tail) -> Result<Self> {
         for dir in [&config.data_dir, &config.cache_dir] {
             std::fs::create_dir_all(dir)
                 .with_context(|| format!("cannot create {}", dir.display()))?;
@@ -950,6 +1335,8 @@ impl Daemon {
             std::fs::remove_file(config.data_dir.join(file)).ok();
         }
 
+        // Soloist says next to nothing unless asked, and what it says is what explains why it
+        // will not sign in or start a song, so it is always asked and its words are kept.
         let mut command = Command::new(&config.binary);
         command
             .arg("--device-name")
@@ -964,27 +1351,36 @@ impl Daemon {
             .arg(volume.to_string())
             .arg("--ws")
             .arg("127.0.0.1:0")
+            .arg("--verbose")
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         #[cfg(windows)]
         command.creation_flags(CREATE_NO_WINDOW);
         let mut child = command.spawn().map_err(|error| {
-            anyhow::Error::new(Fatal(format!(
-                "cannot start {}: {error}; install Soloist from Spotify and set \
-                 {BINARY_VAR} to it",
-                config.binary.display()
-            )))
+            anyhow::Error::new(Fatal(
+                format!(
+                    "cannot start {}: {error}; install Soloist from Spotify and set \
+                     {BINARY_VAR} to it",
+                    config.binary.display()
+                ),
+                Fault::Missing(config.binary.display().to_string()),
+            ))
         })?;
 
+        // Both streams are read whether or not anyone looks, since a full pipe stops Soloist.
+        let (seen, lines) = unbounded_channel();
+        if let Some(stdout) = child.stdout.take() {
+            tokio::spawn(keep(
+                stdout,
+                tail.clone(),
+                config.api_key.clone(),
+                seen.clone(),
+            ));
+        }
         if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    log::debug!("soloist: {line}");
-                }
-            });
+            tokio::spawn(keep(stderr, tail.clone(), config.api_key.clone(), seen));
         }
 
         let endpoint = wait_for_endpoint(&config.data_dir, &mut child).await?;
@@ -994,13 +1390,156 @@ impl Daemon {
         let (socket, _) = tokio_tungstenite::client_async(format!("ws://{endpoint}"), stream)
             .await
             .context("soloist did not accept the WebSocket handshake")?;
-        Ok(Self { child, socket })
+        Ok(Self {
+            child,
+            socket,
+            tail: tail.clone(),
+            lines,
+            endpoint,
+            key: HostKey::of(config),
+        })
     }
 }
 
-/// A failure that starting again cannot mend.
+impl Failed {
+    /// Waits a moment for the last words of a Soloist that has just gone, then picks which to keep.
+    async fn new(error: anyhow::Error, tail: &Tail) -> Self {
+        tokio::time::sleep(TAIL_SETTLE).await;
+        Self {
+            error,
+            said: said(tail),
+        }
+    }
+}
+
+/// Reads Soloist's output line by line into the log, the tail, and the channel the loop reads
+/// Soloist's words from.
+async fn keep(
+    reader: impl AsyncRead + Unpin,
+    tail: Tail,
+    key: String,
+    seen: UnboundedSender<String>,
+) {
+    let mut lines = BufReader::new(reader).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let mut line = plain(&line);
+        if !key.is_empty() {
+            line = line.replace(&key, "<api key>");
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        log::debug!("soloist: {line}");
+        seen.send(line.clone()).ok();
+        let mut tail = tail.lock().unwrap_or_else(PoisonError::into_inner);
+        if tail.len() >= TAIL {
+            tail.pop_front();
+        }
+        tail.push_back(line);
+    }
+}
+
+/// `line` without the colour codes a terminal log carries.
+fn plain(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c == '\u{1b}' {
+            true => {
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            false => out.push(c),
+        }
+    }
+    out
+}
+
+/// The time, level and message of a line of Soloist's log, which reads like
+/// `00:01:18.908 I [/f:462      ] ready, device_name=...`.
+fn read_line(line: &str) -> Option<(char, &str)> {
+    let (time, rest) = line.trim_start().split_once(' ')?;
+    if !time.contains(':') {
+        return None;
+    }
+    let (level, rest) = rest.trim_start().split_once(' ')?;
+    let mut chars = level.chars();
+    let (Some(level), None) = (chars.next(), chars.next()) else {
+        return None;
+    };
+    if !level.is_ascii_uppercase() {
+        return None;
+    }
+    let message = rest.split_once("] ").map_or(rest, |(_, message)| message);
+    Some((level, message.trim()))
+}
+
+/// The last line Soloist printed that tells of a problem, which is what the listener is shown of
+/// why something failed. Errors count, and so do warnings that say a login or a request failed.
+/// Most of its warnings are about audio sessions closing and are left out.
+fn said(tail: &Tail) -> Option<String> {
+    const STRONG: [&str; 6] = [
+        "login failed",
+        "denied",
+        "invalid",
+        "failed to",
+        "forbidden",
+        "unauthor",
+    ];
+    const NOISE: [&str; 5] = [
+        "closeaudiosession",
+        "closed without close source",
+        "event mode capable",
+        "property store",
+        "zero sized file",
+    ];
+    let tail = tail.lock().unwrap_or_else(PoisonError::into_inner);
+    let message = tail.iter().rev().find_map(|line| {
+        let (level, message) = read_line(line)?;
+        let lower = message.to_lowercase();
+        if NOISE.iter().any(|noise| lower.contains(noise)) {
+            return None;
+        }
+        let tells = level == 'E' || STRONG.iter().any(|sign| lower.contains(sign));
+        tells.then_some(message)
+    })?;
+    match message.chars().count() > 160 {
+        true => Some(format!(
+            "{}…",
+            message.chars().take(160).collect::<String>()
+        )),
+        false => Some(message.to_owned()),
+    }
+}
+
+/// An event for a fault, before what Soloist said about it is added.
+fn fault(fault: Fault) -> PlaybackEvent {
+    PlaybackEvent::Fault { fault, said: None }
+}
+
+/// Adds what Soloist last said to every fault in `actions` that has nothing yet, except the ones
+/// that are what it said already.
+fn add_said(actions: &mut [Action], tail: &Tail) {
+    for action in actions {
+        let Action::Emit(PlaybackEvent::Fault {
+            fault,
+            said: said_by,
+        }) = action
+        else {
+            continue;
+        };
+        if said_by.is_none() && !matches!(fault, Fault::Reported(_)) {
+            *said_by = said(tail);
+        }
+    }
+}
+
+/// A failure that starting again cannot mend, and what the listener is told of it.
 #[derive(Debug)]
-struct Fatal(String);
+struct Fatal(String, Fault);
 
 impl std::fmt::Display for Fatal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1009,6 +1548,32 @@ impl std::fmt::Display for Fatal {
 }
 
 impl std::error::Error for Fatal {}
+
+/// Soloist exited while it was being started, with this code or, for `None`, from a signal.
+#[derive(Debug)]
+struct Exit(Option<i32>);
+
+impl std::fmt::Display for Exit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(code) => write!(formatter, "soloist exited with code {code}"),
+            None => formatter.write_str("soloist was stopped by a signal"),
+        }
+    }
+}
+
+impl std::error::Error for Exit {}
+
+/// What the listener is told when starting Soloist failed with `error`.
+fn fault_of(error: &anyhow::Error) -> Fault {
+    if let Some(Fatal(_, fault)) = error.downcast_ref::<Fatal>() {
+        return fault.clone();
+    }
+    match error.downcast_ref::<Exit>() {
+        Some(Exit(code)) => Fault::Exited(*code),
+        None => Fault::Unreachable,
+    }
+}
 
 /// Waits for Soloist to write where its WebSocket API listens.
 async fn wait_for_endpoint(data_dir: &Path, child: &mut Child) -> Result<String> {
@@ -1045,9 +1610,87 @@ fn exited(code: Option<i32>) -> anyhow::Error {
     match code {
         Some(EXPIRED) => anyhow::Error::new(Fatal(
             "this Soloist build has expired; install a newer one from Spotify".to_owned(),
+            Fault::Expired,
         )),
-        Some(code) => anyhow!("soloist exited with code {code}"),
-        None => anyhow!("soloist was stopped by a signal"),
+        code => anyhow::Error::new(Exit(code)),
+    }
+}
+
+/// Stops every Soloist still running on this app's data directory and returns how many it
+/// stopped. None of them can be the one this app is driving, because it is only called once that
+/// one has exited or been killed. Soloists of another data directory are left alone.
+async fn kill_orphans(config: &SoloistConfig) -> usize {
+    let dir = config.data_dir.to_string_lossy().into_owned();
+    #[cfg(unix)]
+    {
+        let name = config
+            .binary
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let listing = Command::new("ps")
+            .args(["-axo", "pid=,command="])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .await;
+        let Ok(listing) = listing else {
+            log::warn!("playback: cannot list processes to look for an orphan soloist");
+            return 0;
+        };
+        let own = std::process::id().to_string();
+        let mut stopped = 0;
+        for line in String::from_utf8_lossy(&listing.stdout).lines() {
+            let line = line.trim_start();
+            let Some((pid, command)) = line.split_once(char::is_whitespace) else {
+                continue;
+            };
+            if pid == own
+                || !command.contains("--data-dir")
+                || !command.contains(&dir)
+                || !command.contains(&name)
+            {
+                continue;
+            }
+            let killed = Command::new("kill")
+                .args(["-KILL", pid])
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+            if killed.is_ok_and(|status| status.success()) {
+                log::warn!("playback: stopped orphan soloist {pid}");
+                stopped += 1;
+            }
+        }
+        stopped
+    }
+    #[cfg(windows)]
+    {
+        // The directory goes in the environment rather than the script, so no quoting can break it.
+        let script = "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and \
+            $_.CommandLine.Contains($env:SONORA_SOLOIST_DIR) -and $_.ProcessId -ne $PID } | \
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force; $_.ProcessId }";
+        let mut command = Command::new("powershell");
+        command
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .env("SONORA_SOLOIST_DIR", &dir)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null());
+        command.creation_flags(CREATE_NO_WINDOW);
+        match command.output().await {
+            Ok(output) => {
+                let stopped = String::from_utf8_lossy(&output.stdout).lines().count();
+                if stopped > 0 {
+                    log::warn!("playback: stopped {stopped} orphan soloist process(es)");
+                }
+                stopped
+            }
+            Err(error) => {
+                log::warn!("playback: cannot look for an orphan soloist: {error}");
+                0
+            }
+        }
     }
 }
 
@@ -1059,8 +1702,20 @@ enum Stop {
     Lost,
 }
 
+/// How a Soloist's run ended.
+struct Ended {
+    stop: Stop,
+    /// The volume last asked for, so the next Soloist starts at it.
+    volume: u8,
+    /// The load to make again on a fresh Soloist, when this one exited with `ORPHANED` while the
+    /// track was still starting and an orphan may be what made it.
+    retry: Option<Order>,
+}
+
 /// Owns Soloist for as long as the engine lives. It starts the process when the first track is
-/// asked for, and starts it again for the next track after it has gone.
+/// asked for, and starts it again for the next track after it has gone. A Soloist that exits with
+/// `ORPHANED` while a track starts is taken to have met an orphan: the orphans are stopped and the
+/// track is loaded once more on a new one.
 async fn drive(
     config: SoloistConfig,
     gain: f32,
@@ -1069,9 +1724,16 @@ async fn drive(
     events: UnboundedSender<PlaybackEvent>,
 ) {
     let mut volume = percent(gain);
+    // A load to make again, and the track the last such retry was for, so one track is retried once.
+    let mut again: Option<Order> = None;
+    let mut retried: Option<String> = None;
     loop {
-        let Some(command) = commands.recv().await else {
-            return;
+        let command = match again.take() {
+            Some(command) => command,
+            None => match commands.recv().await {
+                Some(command) => command,
+                None => return,
+            },
         };
         let id = match &command {
             Order::Load { id, .. } => id.clone(),
@@ -1083,13 +1745,19 @@ async fn drive(
             _ => continue,
         };
 
+        let _host = host().await;
         let daemon = match Daemon::start(&config, volume).await {
             Ok(daemon) => daemon,
-            Err(error) => {
+            Err(Failed { error, said }) => {
                 log::error!("playback: cannot start soloist: {error:#}");
-                if events
-                    .send(PlaybackEvent::Unavailable { id: Some(id) })
-                    .is_err()
+                let fault = PlaybackEvent::Fault {
+                    fault: fault_of(&error),
+                    said,
+                };
+                if events.send(fault).is_err()
+                    || events
+                        .send(PlaybackEvent::Unavailable { id: Some(id) })
+                        .is_err()
                 {
                     return;
                 }
@@ -1099,15 +1767,47 @@ async fn drive(
 
         let mut tracker = Tracker::new(&config.device_name, 0.0);
         tracker.volume = volume;
-        match serve(daemon, tracker, command, interval, &mut commands, &events).await {
-            (Stop::Closed, _) => return,
-            (Stop::Lost, last) => volume = last,
+        let may_retry = retried.as_deref() != Some(id.as_str());
+        let ended = serve(
+            daemon,
+            tracker,
+            command,
+            interval,
+            &mut commands,
+            &events,
+            may_retry,
+        )
+        .await;
+        match ended {
+            Ended {
+                stop: Stop::Closed, ..
+            } => return,
+            Ended {
+                volume: last,
+                retry,
+                ..
+            } => {
+                volume = last;
+                match retry {
+                    Some(order) => {
+                        retried = Some(id);
+                        let stopped = kill_orphans(&config).await;
+                        log::warn!(
+                            "playback: soloist exited while starting a track, stopped {stopped} \
+                             orphan(s) and trying again"
+                        );
+                        again = Some(order);
+                    }
+                    None => retried = None,
+                }
+            }
         }
     }
 }
 
-/// Runs one Soloist until it goes away or the engine is dropped. Returns why, and the volume
-/// last asked for so the next Soloist starts at it.
+/// Runs one Soloist until it goes away or the engine is dropped. `may_retry` is whether a Soloist
+/// that exits with `ORPHANED` while the track starts is to be answered with a retry rather than
+/// with a failed track.
 async fn serve(
     daemon: Daemon,
     mut tracker: Tracker,
@@ -1115,14 +1815,26 @@ async fn serve(
     interval: Duration,
     commands: &mut UnboundedReceiver<Order>,
     events: &UnboundedSender<PlaybackEvent>,
-) -> (Stop, u8) {
-    let Daemon { mut child, socket } = daemon;
+    may_retry: bool,
+) -> Ended {
+    let Daemon {
+        mut child,
+        socket,
+        tail,
+        mut lines,
+        endpoint,
+        key,
+    } = daemon;
     let (mut sink, mut stream) = socket.split();
     let mut ticker = tokio::time::interval(interval.max(MIN_TICK));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // Why Soloist went away, when it did so by itself, and what the listener is told of it.
+    let mut exit: Option<Option<i32>> = None;
+    let mut fault: Option<Fault> = None;
     let mut actions = tracker.on_command(first, Instant::now());
     let stop = loop {
+        add_said(&mut actions, &tail);
         if let Some(stop) = perform(actions, &mut sink, events).await {
             break stop;
         }
@@ -1139,36 +1851,100 @@ async fn serve(
                         Vec::new()
                     }
                 },
-                Some(Ok(Message::Close(_))) | None => break Stop::Lost,
+                Some(Ok(Message::Close(_))) | None => {
+                    fault = Some(Fault::Unreachable);
+                    break Stop::Lost;
+                }
                 Some(Err(error)) => {
                     log::warn!("playback: soloist socket failed: {error}");
+                    fault = Some(Fault::Unreachable);
                     break Stop::Lost;
                 }
                 Some(Ok(_)) => Vec::new(),
             },
             status = child.wait() => {
                 match status {
-                    Ok(status) => match status.code() {
-                        Some(EXPIRED) => log::error!("playback: {}", exited(Some(EXPIRED))),
-                        code => log::warn!("playback: {}", exited(code)),
-                    },
-                    Err(error) => log::warn!("playback: cannot watch soloist: {error}"),
+                    Ok(status) => {
+                        let code = status.code();
+                        match code {
+                            Some(EXPIRED) => {
+                                log::error!("playback: {}", exited(Some(EXPIRED)));
+                                fault = Some(Fault::Expired);
+                            }
+                            code => {
+                                log::warn!("playback: {}", exited(code));
+                                fault = Some(Fault::Exited(code));
+                            }
+                        }
+                        exit = Some(code);
+                    }
+                    Err(error) => {
+                        log::warn!("playback: cannot watch soloist: {error}");
+                        fault = Some(Fault::Unreachable);
+                    }
                 }
                 break Stop::Lost;
             },
             _ = ticker.tick() => tracker.on_tick(Instant::now(), epoch_ms()),
+            Some(line) = lines.recv() => tracker.on_line(&line, Instant::now()),
         };
     };
 
-    // The daemon is stopped before anything reads the events, so a track loaded straight away
-    // finds the data directory free.
-    child.kill().await.ok();
-    for action in tracker.on_lost() {
-        if let Action::Emit(event) = action {
-            events.send(event).ok();
+    log::info!(
+        "playback: the run with soloist ended, closed {}, exit {exit:?}, fault {fault:?}, a track \
+         was waiting for it: {}",
+        matches!(stop, Stop::Closed),
+        tracker.retry_order().is_some()
+    );
+    // A Soloist that is still running when its engine goes away is left running for the next
+    // engine, paused so it does not play on with no one to hear it. One that is gone, or that
+    // the app lost touch with, is stopped before anything reads the events, so a track loaded
+    // straight away finds the data directory free.
+    match matches!(stop, Stop::Closed) && exit.is_none() {
+        true => {
+            if tracker.status == Status::Playing {
+                let pause = Message::text(Out::Pause.json());
+                tokio::time::timeout(Duration::from_secs(1), sink.send(pause))
+                    .await
+                    .ok();
+            }
+            sink.close().await.ok();
+            park(Host {
+                child,
+                tail: tail.clone(),
+                lines,
+                endpoint,
+                key,
+            });
+        }
+        false => {
+            child.kill().await.ok();
+            *LAST_END.lock().unwrap_or_else(PoisonError::into_inner) =
+                Some(std::time::Instant::now());
         }
     }
-    (stop, tracker.volume)
+    let retry = match (may_retry, exit) {
+        (true, Some(Some(ORPHANED))) => tracker.retry_order(),
+        _ => None,
+    };
+    if retry.is_none() {
+        if let Some(fault) = fault {
+            // Soloist's last words may still be on their way out of its pipes.
+            tokio::time::sleep(TAIL_SETTLE).await;
+            let said = said(&tail);
+            events.send(PlaybackEvent::Fault { fault, said }).ok();
+        }
+        for action in tracker.on_lost() {
+            if let Action::Emit(event) = action {
+                events.send(event).ok();
+            }
+        }
+    }
+    Ended {
+        stop,
+        volume: tracker.volume,
+        retry,
+    }
 }
 
 /// Carries out what the tracker decided. Returns why the loop must stop, if it must.

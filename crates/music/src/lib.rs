@@ -604,6 +604,28 @@ impl Codec {
     }
 }
 
+/// Why Soloist, the client Spotify may play through, could not do what it was asked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Fault {
+    /// The executable could not be started. Holds the path it was asked for.
+    Missing(String),
+    /// The build has passed its 90 days.
+    Expired,
+    /// Soloist exited with this code, or `None` when a signal stopped it.
+    Exited(Option<i32>),
+    /// Soloist is not signed in, which it stays until its device is picked in Spotify once. Holds
+    /// the device's name, which is what to pick.
+    NotSignedIn(String),
+    /// Soloist took the track but never started it.
+    NeverStarted,
+    /// Soloist's local WebSocket API could not be reached, or dropped.
+    Unreachable,
+    /// Soloist reported an error of its own.
+    Reported(String),
+    /// Soloist does not accept the API key it was started with.
+    InvalidKey,
+}
+
 /// What an engine reports back. `Playing` and `Seeked` mean audio from `at` is reaching the
 /// output, not that a decoder is ready, so whatever follows the sound can start on them.
 #[derive(Clone, Debug, PartialEq)]
@@ -658,6 +680,14 @@ pub enum PlaybackEvent {
     /// there rather than where a clock that kept running during the switch would say.
     OutputChanged {
         heard: Option<(String, Duration)>,
+    },
+    /// The engine failed in a way the listener can act on, so the app says what happened rather
+    /// than only that a track could not be played. It names no track, and a failed load still
+    /// reports `Unavailable` of its own. `said` is what the engine last printed that reads like
+    /// a problem, when it printed any.
+    Fault {
+        fault: Fault,
+        said: Option<String>,
     },
     /// What the engine knows about the sound of track `id`, sent as it starts decoding it. A
     /// track queued behind the current one reports before it is heard.

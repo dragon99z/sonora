@@ -79,6 +79,13 @@ const PRELOAD_BEFORE_END: Duration = Duration::from_secs(10);
 const SKIP_DEBOUNCE: Duration = Duration::from_millis(250);
 const RESTART_WINDOW: Duration = Duration::from_secs(3);
 const KEY_COOLDOWN: Duration = Duration::from_secs(1);
+/// How many times in a window a Soloist that went away while playing is started again by itself.
+/// A Soloist that keeps going away is left, with the track held, for the listener to decide on.
+const SOLOIST_RESTARTS: usize = 3;
+const SOLOIST_RESTART_WINDOW: Duration = Duration::from_secs(60);
+/// How long after Soloist reports a fault a track failing is put down to it. The engine reports
+/// the fault just before the track fails, so this only has to cover that gap.
+const SOLOIST_FAULT_WINDOW: Duration = Duration::from_secs(5);
 /// How long after a play or pause press an engine event saying the opposite is taken for the
 /// echo of an earlier press rather than news. Past it the engine is believed again, so a pause
 /// the engine makes on its own is not lost for good.
@@ -475,6 +482,11 @@ pub struct Playback {
     skipped: Option<Instant>,
     /// No load goes out before this after a track failed, so a bad key cannot be hammered.
     blocked_until: Option<Instant>,
+    /// When Soloist last reported a fault, and whether it was that the process went away, so the
+    /// track that fails with it is held and not skipped.
+    soloist_fault: Option<(Instant, bool)>,
+    /// When Soloist was last started again by itself after going away while playing.
+    soloist_restarts: Vec<Instant>,
     /// Loads that failed since audio last played or the user last chose a track.
     failures: u8,
     /// Loads the provider turned down for now since audio last played or the user last picked a
@@ -639,6 +651,8 @@ impl Playback {
             preloaded: None,
             skipped: None,
             blocked_until: None,
+            soloist_fault: None,
+            soloist_restarts: Vec::new(),
             failures: 0,
             throttles: 0,
             paused_at: None,
@@ -2765,6 +2779,11 @@ impl Playback {
             self.learn_signal(id, track, cx);
             return;
         }
+        // Soloist failing is told to the listener whatever is playing, since it names no track
+        if let BackendEvent::Fault { fault, said } = event {
+            self.report_fault(fault, said, cx);
+            return;
+        }
         if local != self.local_active() {
             return;
         }
@@ -2793,7 +2812,9 @@ impl Playback {
         }
         match event {
             // rebuilt or kept before the filters above
-            BackendEvent::OutputChanged { .. } | BackendEvent::Signal { .. } => {}
+            BackendEvent::OutputChanged { .. }
+            | BackendEvent::Signal { .. }
+            | BackendEvent::Fault { .. } => {}
             BackendEvent::Unavailable { .. }
             | BackendEvent::Throttled { .. }
             | BackendEvent::Refused
@@ -2897,6 +2918,28 @@ impl Playback {
                 self.state = PlaybackState::Loading;
                 log::warn!("playback: the provider went stale, waiting for a reconnect");
             }
+            // The fault has been told in a toast already. The track stays, paused, so that play
+            // tries it again and tells the listener again if it still fails, and nothing is
+            // skipped on the way.
+            BackendEvent::Unavailable { .. } if self.soloist_fault_fresh() => {
+                let went_away = self.soloist_fault.take().is_some_and(|(_, lost)| lost);
+                // Where the track was when Soloist failed, which is where play picks it up.
+                let at = self.live_position();
+                let was_playing = self.intent == Intent::Play;
+                self.fetch = None;
+                self.hold(at, cx);
+                match went_away && was_playing && self.may_restart_soloist() {
+                    true => {
+                        log::warn!(
+                            "playback: soloist went away while playing, starting it again at {at:?}"
+                        );
+                        self.resume(cx);
+                    }
+                    false => {
+                        log::warn!("playback: soloist could not play the track, pausing on it")
+                    }
+                }
+            }
             BackendEvent::Unavailable { .. } => {
                 let failed = self.track.take();
                 let target = failed.as_ref().and_then(song_target);
@@ -2948,6 +2991,64 @@ impl Playback {
             }
         }
         cx.notify();
+    }
+
+    /// Whether the track that just failed did so because of a fault Soloist reported.
+    fn soloist_fault_fresh(&self) -> bool {
+        self.soloist_fault
+            .is_some_and(|(at, _)| at.elapsed() < SOLOIST_FAULT_WINDOW)
+    }
+
+    /// Whether a Soloist that went away may be started again by itself now, which it may a few
+    /// times in a minute and no more, so one that cannot stay up does not loop.
+    fn may_restart_soloist(&mut self) -> bool {
+        let now = Instant::now();
+        self.soloist_restarts
+            .retain(|at| now.duration_since(*at) < SOLOIST_RESTART_WINDOW);
+        if self.soloist_restarts.len() >= SOLOIST_RESTARTS {
+            return false;
+        }
+        self.soloist_restarts.push(now);
+        true
+    }
+
+    /// Tells the listener what went wrong with Soloist, in a toast that says what to do about it.
+    /// `said` is the last problem Soloist printed, which goes in the toast when there is one,
+    /// since it is the nearest thing to a reason.
+    fn report_fault(&mut self, fault: music::Fault, said: Option<String>, cx: &mut Context<Self>) {
+        log::warn!("playback: soloist fault: {fault:?}, said {said:?}");
+        self.soloist_fault = Some((
+            Instant::now(),
+            matches!(fault, music::Fault::Unreachable | music::Fault::Exited(_)),
+        ));
+        let (key, detail) = match fault {
+            music::Fault::Missing(path) => ("toast-soloist-missing", Some(path)),
+            music::Fault::Expired => ("toast-soloist-expired", None),
+            music::Fault::Exited(code) => (
+                "toast-soloist-exited",
+                said.or_else(|| {
+                    Some(code.map_or_else(
+                        || "stopped by a signal".to_owned(),
+                        |code| format!("exit code {code}"),
+                    ))
+                }),
+            ),
+            music::Fault::NotSignedIn(device) => (
+                "toast-soloist-not-signed-in",
+                Some(match said {
+                    Some(said) => format!("{device} ({said})"),
+                    None => device,
+                }),
+            ),
+            music::Fault::NeverStarted => ("toast-soloist-never-started", said),
+            music::Fault::Unreachable => ("toast-soloist-unreachable", said),
+            music::Fault::Reported(message) => ("toast-soloist-error", Some(message)),
+            music::Fault::InvalidKey => ("toast-soloist-key-rejected", None),
+        };
+        match detail {
+            Some(detail) => Toasts::with_detail(Outcome::Failed, key, None, detail, cx),
+            None => Toasts::show(Outcome::Failed, key, cx),
+        }
     }
 
     /// Whether failing tracks point at the Widevine module: the current provider needs one,
