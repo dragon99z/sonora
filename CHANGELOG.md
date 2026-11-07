@@ -18,6 +18,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A quick flick on a touchpad under Wayland keeps the page scrolling for a moment after your fingers lift.
 - Spotify can play through Spotify's own Soloist client, for accounts that librespot can no longer
   get audio for. Turn it on with your Soloist API key under Spotify Soloist in Settings > Providers.
+- Spotify through Soloist follows the stream quality, with lossless as the top level, the
+  loudness normalisation and the gapless setting under Playback.
+- Soloist is stopped with Sonora on Windows, including when Sonora is closed right after it starts.
+- Changing a playback setting while a song plays through Soloist resumes the song instead of leaving
+  it paused.
 
 ### Changed
 

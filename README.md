@@ -163,7 +163,11 @@ environment variables `SONORA_SOLOIST_API_KEY` and `SONORA_SOLOIST_BIN` do the s
 setting is left blank, and `SONORA_SOLOIST_NAME` sets the device name. The first time, open the
 Spotify app and pick that device once to pair it. Soloist plays through the system audio output
 on its own, so the equalizer and spectrum do not apply, and downloads are not available while it
-is in use. Whether Spotify's terms allow this use is for you to check.
+is in use. Stream quality, including lossless, loudness normalisation and gapless playback follow
+the settings under Playback. Soloist has no setting for the first two, so Sonora writes them into
+the preferences Soloist reads as it starts, which Spotify does not document and may change. Soloist
+never says what it streamed, so the quality shown is the most it is asked for. Whether Spotify's
+terms allow this use is for you to check.
 
 ## Community
 

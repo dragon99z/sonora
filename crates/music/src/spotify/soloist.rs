@@ -13,6 +13,7 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -28,7 +29,10 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::{Fault, PlaybackConfig, PlaybackEvent, PlaybackEvents, PlaybackFactory, Player};
+use super::soloist_prefs::{self, Prefs};
+use crate::{
+    Fault, PlaybackConfig, PlaybackEvent, PlaybackEvents, PlaybackFactory, Player, Quality,
+};
 
 const TRACK_PREFIX: &str = "spotify:track:";
 const API_KEY_VAR: &str = "SONORA_SOLOIST_API_KEY";
@@ -80,6 +84,17 @@ const SEEK_PATIENCE: Duration = Duration::from_secs(5);
 const END_GRACE: Duration = Duration::from_secs(3);
 /// The least time between two position reports, whatever the app asks for.
 const MIN_TICK: Duration = Duration::from_millis(50);
+/// How long a track that Soloist was asked to queue is given to begin on its own before it is
+/// played outright, for a Soloist that did not take the queue entry.
+const FOLLOW_WAIT: Duration = Duration::from_secs(3);
+/// How long a track that Soloist went on to by itself waits for the app to load it, before it is
+/// paused as one the app does not want.
+const ADOPT_WAIT: Duration = Duration::from_secs(2);
+/// Whether Soloist has been started again to read the preferences of a first pairing.
+static SEEDED: AtomicBool = AtomicBool::new(false);
+/// How long after Soloist signs in its preferences are watched for a file that has not got the
+/// app's values yet, which is what a first pairing leaves.
+const PREFS_WATCH: Duration = Duration::from_secs(30);
 /// Keeps a console window from opening for Soloist on Windows. Soloist is a console program, and
 /// a release build of the app has no console of its own for it to share.
 #[cfg(windows)]
@@ -98,6 +113,9 @@ pub struct SoloistConfig {
     pub data_dir: PathBuf,
     /// Where Soloist keeps what it can fetch again.
     pub cache_dir: PathBuf,
+    /// The stream level and loudness normalisation Soloist is started with. Soloist reads them
+    /// only as it starts, so a change starts it again.
+    pub prefs: Prefs,
 }
 
 impl std::fmt::Debug for SoloistConfig {
@@ -109,6 +127,7 @@ impl std::fmt::Debug for SoloistConfig {
             .field("device_name", &self.device_name)
             .field("data_dir", &self.data_dir)
             .field("cache_dir", &self.cache_dir)
+            .field("prefs", &self.prefs)
             .finish()
     }
 }
@@ -121,6 +140,10 @@ impl SoloistConfig {
             device_name,
             data_dir: crate::credentials::dir("spotify-soloist"),
             cache_dir: crate::credentials::root().join("soloist"),
+            prefs: Prefs {
+                quality: Quality::default(),
+                normalise: true,
+            },
         }
     }
 
@@ -182,20 +205,34 @@ impl PlaybackFactory for Factory {
     fn start(&self, config: PlaybackConfig) -> (Box<dyn Player>, Box<dyn PlaybackEvents>) {
         let (commands, command_rx) = unbounded_channel();
         let (events, event_rx) = unbounded_channel();
+        let mut soloist = self.config.clone();
+        soloist.prefs = Prefs {
+            quality: config.quality,
+            normalise: config.normalisation,
+        };
         self.runtime.spawn(drive(
-            self.config.clone(),
+            soloist,
             config.gain,
             config.position_interval,
+            config.gapless,
             command_rx,
             events,
         ));
-        (Box::new(Engine { commands }), Box::new(Events(event_rx)))
+        (
+            Box::new(Engine {
+                commands,
+                gapless: config.gapless,
+            }),
+            Box::new(Events(event_rx)),
+        )
     }
 }
 
 /// The transport the app drives. Every call queues a command for the task that owns Soloist.
 pub struct Engine {
     commands: UnboundedSender<Order>,
+    /// Whether the next track is queued in Soloist ahead of the end of this one.
+    gapless: bool,
 }
 
 impl Engine {
@@ -207,11 +244,12 @@ impl Engine {
 }
 
 impl Player for Engine {
-    fn load(&self, track_id: &str, at: Duration, _seamless: bool) -> Result<()> {
+    fn load(&self, track_id: &str, at: Duration, seamless: bool) -> Result<()> {
         self.send(Order::Load {
             id: track_id.to_owned(),
             at,
             paused: false,
+            seamless,
         })
     }
 
@@ -220,11 +258,19 @@ impl Player for Engine {
             id: track_id.to_owned(),
             at,
             paused: true,
+            seamless: false,
         })
     }
 
-    /// Soloist has no way to line a track up behind the current one, so there is nothing to do.
-    fn preload(&self, _track_id: &str, _segue: bool) -> Result<()> {
+    /// Lines the next track up in Soloist's own queue, so Soloist goes on to it with no gap. Only
+    /// the track that follows this one is queued, and only with gapless on, since Soloist has no
+    /// way to take a track out of its queue again.
+    fn preload(&self, track_id: &str, segue: bool) -> Result<()> {
+        if self.gapless && segue {
+            self.send(Order::Queue {
+                id: track_id.to_owned(),
+            })?;
+        }
         Ok(())
     }
 
@@ -262,6 +308,12 @@ enum Order {
         id: String,
         at: Duration,
         paused: bool,
+        /// The load follows on from the track before it in the queue.
+        seamless: bool,
+    },
+    /// Lines a track up behind the one that plays.
+    Queue {
+        id: String,
     },
     Play,
     Pause,
@@ -392,6 +444,7 @@ enum Out {
     Pause,
     Seek(u64),
     Volume(u8),
+    AddToQueue(String),
     Activate,
     Deactivate,
     GetState,
@@ -409,6 +462,9 @@ impl Out {
             }
             Self::Volume(volume) => {
                 json!({ "type": "command", "command": "set_volume", "volume": volume })
+            }
+            Self::AddToQueue(uri) => {
+                json!({ "type": "command", "command": "add_to_queue", "uri": uri })
             }
             Self::Activate => json!({ "type": "command", "command": "activate" }),
             Self::Deactivate => json!({ "type": "command", "command": "deactivate" }),
@@ -465,6 +521,17 @@ struct Wanted {
     last_seek: Option<PendingSeek>,
     /// When the track is given up as unavailable if Soloist has not reported it by then.
     deadline: Option<Instant>,
+    /// The track is waited for in Soloist's queue rather than asked for, until then.
+    follow_until: Option<Instant>,
+}
+
+/// A track Soloist went on to by itself from its queue, which the app has not loaded yet.
+#[derive(Debug)]
+struct Adopted {
+    uri: String,
+    duration: Option<Duration>,
+    /// When the track is paused as one the app has no use for.
+    until: Instant,
 }
 
 /// A seek not yet sent. `report` is whether the app asked for it, and so is told when it is done:
@@ -514,6 +581,12 @@ struct Tracker {
     /// Soloist waited for the listener to pick it in Spotify, so its next login is theirs.
     paired_by_user: bool,
     reclaim: Option<Reclaim>,
+    /// Whether the track after this one is queued in Soloist.
+    gapless: bool,
+    /// The track queued in Soloist that has not begun. Soloist cannot unqueue it, so while it is
+    /// there no other is queued.
+    queued: Option<String>,
+    adopted: Option<Adopted>,
 }
 
 impl Tracker {
@@ -534,6 +607,9 @@ impl Tracker {
             error_reported: false,
             paired_by_user: false,
             reclaim: None,
+            gapless: false,
+            queued: None,
+            adopted: None,
         }
     }
 
@@ -620,6 +696,7 @@ impl Tracker {
             id: wanted.id.clone(),
             at: wanted.at,
             paused: wanted.hold,
+            seamless: false,
         })
     }
 
@@ -627,13 +704,32 @@ impl Tracker {
     fn on_command(&mut self, command: Order, now: Instant) -> Vec<Action> {
         let mut out = Vec::new();
         match command {
-            Order::Load { id, at, paused } => {
+            Order::Load {
+                id,
+                at,
+                paused,
+                seamless,
+            } => {
                 let uri = format!("{TRACK_PREFIX}{id}");
                 out.push(Action::Emit(PlaybackEvent::Loading {
                     id: Some(id.clone()),
                     at,
                 }));
-                self.anchor = None;
+                // A track Soloist went on to from its queue is the one the app now asks for, so
+                // it is taken over as it is, playing, instead of being started again.
+                let adopted = self
+                    .adopted
+                    .take()
+                    .filter(|adopted| seamless && at.is_zero() && adopted.uri == uri);
+                // A track that is queued but not begun is waited for rather than asked for.
+                let following = adopted.is_none()
+                    && seamless
+                    && at.is_zero()
+                    && self.logged_in
+                    && self.queued.as_deref() == Some(uri.as_str());
+                if adopted.is_none() {
+                    self.anchor = None;
+                }
                 // What was allowed of the last track says nothing of this one.
                 self.can_seek = false;
                 self.wanted = Some(Wanted {
@@ -641,7 +737,7 @@ impl Tracker {
                     uri,
                     at,
                     hold: paused,
-                    sent: false,
+                    sent: adopted.is_some() || following,
                     seen: false,
                     done: false,
                     reported: None,
@@ -651,7 +747,21 @@ impl Tracker {
                     seek_until: None,
                     last_seek: None,
                     deadline: Some(now + LOAD_WAIT),
+                    follow_until: following.then_some(now + FOLLOW_WAIT),
                 });
+                if let Some(adopted) = adopted {
+                    let status = self.status;
+                    if let Some(wanted) = self.wanted.as_mut() {
+                        Self::start(wanted, adopted.duration, false, now, &mut out);
+                        Self::announce(wanted, status, &mut out);
+                    }
+                    // The position anchor of a track that began between two loads was not kept.
+                    out.push(Action::Send(Out::GetState));
+                    return out;
+                }
+                if following {
+                    return out;
+                }
                 match self.logged_in {
                     true => self.send_play(now, &mut out),
                     // A Soloist that has said it cannot be used is not waited on again, since
@@ -671,7 +781,29 @@ impl Tracker {
                     ),
                 }
             }
+            Order::Queue { id } => {
+                let uri = format!("{TRACK_PREFIX}{id}");
+                let playing = self
+                    .wanted
+                    .as_ref()
+                    .is_some_and(|wanted| wanted.seen && !wanted.done && wanted.uri != uri);
+                if self.gapless
+                    && self.logged_in
+                    && playing
+                    && self.queued.is_none()
+                    && self.adopted.is_none()
+                {
+                    self.queued = Some(uri.clone());
+                    out.push(Action::Send(Out::AddToQueue(uri)));
+                }
+            }
             Order::Play => {
+                // A track loaded to wait paused is still held until Soloist says it paused. Asked
+                // to play before that, as an engine that was just swapped is, it is not held any
+                // more, or the pause meant for the wait would come after this and win.
+                if let Some(wanted) = self.wanted.as_mut().filter(|wanted| !wanted.done) {
+                    wanted.hold = false;
+                }
                 if self.logged_in {
                     out.push(Action::Send(Out::Play(None)));
                 }
@@ -759,6 +891,9 @@ impl Tracker {
                 self.observe_status(status, epoch_ms, &mut out);
             }
             Incoming::PositionSync { position } => {
+                if self.adopted.is_some() {
+                    self.anchor = Some(position);
+                }
                 if self.is_wanted_playing() {
                     self.anchor = Some(position);
                     let at = position.at(epoch_ms);
@@ -847,6 +982,17 @@ impl Tracker {
             }
             _ => {}
         }
+        if self
+            .adopted
+            .as_ref()
+            .is_some_and(|adopted| now >= adopted.until)
+        {
+            // The app went on to nothing, so the track Soloist went on to is not wanted.
+            self.adopted = None;
+            if self.logged_in {
+                out.push(Action::Send(Out::Pause));
+            }
+        }
         let Self {
             wanted,
             anchor,
@@ -861,6 +1007,11 @@ impl Tracker {
         };
 
         if !wanted.seen {
+            if wanted.follow_until.is_some_and(|until| now >= until) {
+                // Soloist did not go on to the queued track, so it is asked for after all.
+                wanted.follow_until = None;
+                out.push(Action::Send(Out::Play(Some(wanted.uri.clone()))));
+            }
             if wanted.deadline.is_some_and(|deadline| now >= deadline) {
                 match logged_in {
                     true => {
@@ -983,36 +1134,55 @@ impl Tracker {
         wanted.deadline = Some(now + LOAD_WAIT);
 
         if self.current.as_deref() == Some(wanted.uri.as_str()) {
-            let at = wanted.at;
             Self::start(wanted, None, true, now, out);
-            let status = self.status;
-            // The track is already the current one, so it will report no change when it
-            // restarts. Say what is true now rather than wait for it.
-            if wanted.hold {
-                wanted.hold = false;
-                wanted.reported = Some(Status::Paused);
-                out.push(Action::Emit(PlaybackEvent::Paused {
-                    id: Some(wanted.id.clone()),
-                    at,
-                }));
-            } else if status == Status::Playing {
-                wanted.reported = Some(Status::Playing);
-                out.push(Action::Emit(PlaybackEvent::Playing {
-                    id: Some(wanted.id.clone()),
-                    at,
-                }));
-            }
+            Self::announce(wanted, self.status, out);
+        }
+    }
+
+    /// Says what is true of a track that is already the current one, which reports no change
+    /// when it starts: that it waits paused, or that it plays.
+    fn announce(wanted: &mut Wanted, status: Status, out: &mut Vec<Action>) {
+        let at = wanted.at;
+        if wanted.hold {
+            wanted.hold = false;
+            wanted.reported = Some(Status::Paused);
+            out.push(Action::Emit(PlaybackEvent::Paused {
+                id: Some(wanted.id.clone()),
+                at,
+            }));
+        } else if status == Status::Playing {
+            wanted.reported = Some(Status::Playing);
+            out.push(Action::Emit(PlaybackEvent::Playing {
+                id: Some(wanted.id.clone()),
+                at,
+            }));
         }
     }
 
     /// Soloist reported `item` as the current one.
     fn observe_item(&mut self, item: &Entity, now: Instant, out: &mut Vec<Action>) {
         self.current = Some(item.uri.clone());
+        let followed = self.queued.as_deref() == Some(item.uri.as_str());
+        let live = self.wanted.as_ref().is_some_and(|wanted| !wanted.done);
+        if followed && !live {
+            // The track before it ended some other way first, and Soloist went on regardless.
+            self.queued = None;
+            self.adopted = Some(Adopted {
+                uri: item.uri.clone(),
+                duration: item.duration(),
+                until: now + ADOPT_WAIT,
+            });
+            return;
+        }
         let Some(wanted) = self.wanted.as_mut().filter(|wanted| !wanted.done) else {
             return;
         };
         if item.uri == wanted.uri {
+            if followed {
+                self.queued = None;
+            }
             if !wanted.seen {
+                wanted.follow_until = None;
                 Self::start(wanted, item.duration(), false, now, out);
             } else if wanted.duration.is_none()
                 && let Some(length) = item.duration()
@@ -1024,13 +1194,26 @@ impl Tracker {
                 }));
             }
         } else if wanted.seen {
-            // Something else is playing, which is how a track that ran out looks when Soloist
-            // goes on to a track of its own. Silence it: the app chooses what comes next.
             wanted.done = true;
             out.push(Action::Emit(PlaybackEvent::Ended {
                 id: Some(wanted.id.clone()),
             }));
-            out.push(Action::Send(Out::Pause));
+            match followed {
+                // The track that was queued has begun, which is the join the app waits for. It
+                // plays on, and is taken over when the app loads it.
+                true => {
+                    self.queued = None;
+                    self.adopted = Some(Adopted {
+                        uri: item.uri.clone(),
+                        duration: item.duration(),
+                        until: now + ADOPT_WAIT,
+                    });
+                }
+                // Something else is playing, which is how a track that ran out looks when
+                // Soloist goes on to a track of its own. Silence it: the app chooses what
+                // comes next.
+                false => out.push(Action::Send(Out::Pause)),
+            }
         }
     }
 
@@ -1169,6 +1352,8 @@ struct HostKey {
     device_name: String,
     data_dir: PathBuf,
     cache_dir: PathBuf,
+    /// Soloist reads these as it starts, so one started with others is not used again.
+    prefs: Prefs,
 }
 
 impl HostKey {
@@ -1179,6 +1364,7 @@ impl HostKey {
             device_name: config.device_name.clone(),
             data_dir: config.data_dir.clone(),
             cache_dir: config.cache_dir.clone(),
+            prefs: config.prefs,
         }
     }
 }
@@ -1287,6 +1473,64 @@ async fn adopt(config: &SoloistConfig) -> Option<Daemon> {
     })
 }
 
+/// Ties a Soloist to the app on Windows. `kill_on_drop` stops it only when the runtime is dropped,
+/// which an app that is closed in the first moments, or ended by the system, never gets to. A job
+/// that kills what is in it when it closes does, since Windows closes it with the process.
+#[cfg(windows)]
+mod job {
+    use std::ffi::c_void;
+    use std::mem::size_of;
+    use std::sync::OnceLock;
+
+    use anyhow::{Context, Result, anyhow};
+    use tokio::process::Child;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+    use windows::core::PCWSTR;
+
+    /// The job, as the number of its handle. It is never closed by the app: it stays open until
+    /// the process ends, which is when it takes everything in it along.
+    static JOB: OnceLock<Result<usize, String>> = OnceLock::new();
+
+    fn create() -> Result<usize> {
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: `limits` is a live value of the type the information class asks for, and its
+        // size is passed with it. The job handle is made here and is not closed.
+        unsafe {
+            let job = CreateJobObjectW(None, PCWSTR::null()).context("cannot create the job")?;
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&limits).cast::<c_void>(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+            .context("cannot make the job stop what is in it")?;
+            Ok(job.0 as usize)
+        }
+    }
+
+    /// Puts `child` in the job, which is made the first time.
+    pub fn bind(child: &Child) -> Result<()> {
+        let job = JOB
+            .get_or_init(|| create().map_err(|error| format!("{error:#}")))
+            .as_ref()
+            .map_err(|error| anyhow!("{error}"))?;
+        let process = child
+            .raw_handle()
+            .context("the process has already ended")?;
+        // SAFETY: both handles are open, the process one for as long as `child` lives.
+        unsafe {
+            AssignProcessToJobObject(HANDLE(*job as *mut c_void), HANDLE(process.cast()))
+                .context("cannot put soloist in the job")
+        }
+    }
+}
+
 /// Why Soloist could not be started, and the last thing it said about it.
 struct Failed {
     error: anyhow::Error,
@@ -1330,6 +1574,16 @@ impl Daemon {
             std::fs::create_dir_all(dir)
                 .with_context(|| format!("cannot create {}", dir.display()))?;
         }
+        // Soloist reads its playback preferences as it starts and rewrites them as it exits, so
+        // they are set here, while none runs. Without them it plays as it would have.
+        match soloist_prefs::apply(&config.data_dir, config.prefs) {
+            Ok(0) => {}
+            Ok(files) => log::info!(
+                "playback: set the stream level and normalisation in {files} soloist \
+                 preference file(s)"
+            ),
+            Err(error) => log::warn!("playback: cannot set soloist's preferences: {error}"),
+        }
         // Files left by a Soloist that did not get to clean up would point at a dead port.
         for file in ["ws.addr", "ws.port"] {
             std::fs::remove_file(config.data_dir.join(file)).ok();
@@ -1368,6 +1622,12 @@ impl Daemon {
                 Fault::Missing(config.binary.display().to_string()),
             ))
         })?;
+        // Soloist is stopped with the app even when the app is closed too fast, or too hard, for
+        // the runtime to stop it.
+        #[cfg(windows)]
+        if let Err(error) = job::bind(&child) {
+            log::warn!("playback: cannot tie soloist to the app, so it can outlive it: {error}");
+        }
 
         // Both streams are read whether or not anyone looks, since a full pipe stops Soloist.
         let (seen, lines) = unbounded_channel();
@@ -1720,6 +1980,7 @@ async fn drive(
     config: SoloistConfig,
     gain: f32,
     interval: Duration,
+    gapless: bool,
     mut commands: UnboundedReceiver<Order>,
     events: UnboundedSender<PlaybackEvent>,
 ) {
@@ -1746,6 +2007,7 @@ async fn drive(
         };
 
         let _host = host().await;
+        let first_pairing = !soloist_prefs::has_account(&config.data_dir);
         let daemon = match Daemon::start(&config, volume).await {
             Ok(daemon) => daemon,
             Err(Failed { error, said }) => {
@@ -1767,15 +2029,21 @@ async fn drive(
 
         let mut tracker = Tracker::new(&config.device_name, 0.0);
         tracker.volume = volume;
+        tracker.gapless = gapless;
         let may_retry = retried.as_deref() != Some(id.as_str());
+        let run = Run {
+            config: &config,
+            may_retry,
+            first_pairing,
+        };
         let ended = serve(
             daemon,
+            run,
             tracker,
             command,
             interval,
             &mut commands,
             &events,
-            may_retry,
         )
         .await;
         match ended {
@@ -1793,7 +2061,7 @@ async fn drive(
                         retried = Some(id);
                         let stopped = kill_orphans(&config).await;
                         log::warn!(
-                            "playback: soloist exited while starting a track, stopped {stopped} \
+                            "playback: soloist stopped while starting a track, stopped {stopped} \
                              orphan(s) and trying again"
                         );
                         again = Some(order);
@@ -1805,17 +2073,26 @@ async fn drive(
     }
 }
 
-/// Runs one Soloist until it goes away or the engine is dropped. `may_retry` is whether a Soloist
-/// that exits with `ORPHANED` while the track starts is to be answered with a retry rather than
-/// with a failed track.
+/// What one run of Soloist was started with.
+struct Run<'a> {
+    config: &'a SoloistConfig,
+    /// Whether a Soloist that exits with `ORPHANED` while the track starts, or is stopped to read
+    /// its preferences, is to be answered with a retry rather than with a failed track.
+    may_retry: bool,
+    /// Whether the account had no preferences file when this Soloist was started, which is a
+    /// first pairing: Soloist makes the file after it has read the preferences.
+    first_pairing: bool,
+}
+
+/// Runs one Soloist until it goes away or the engine is dropped.
 async fn serve(
     daemon: Daemon,
+    run: Run<'_>,
     mut tracker: Tracker,
     first: Order,
     interval: Duration,
     commands: &mut UnboundedReceiver<Order>,
     events: &UnboundedSender<PlaybackEvent>,
-    may_retry: bool,
 ) -> Ended {
     let Daemon {
         mut child,
@@ -1832,6 +2109,10 @@ async fn serve(
     // Why Soloist went away, when it did so by itself, and what the listener is told of it.
     let mut exit: Option<Option<i32>> = None;
     let mut fault: Option<Fault> = None;
+    // Watching the preferences after sign-in, and whether Soloist is stopped to read them.
+    let mut watch: Option<Instant> = None;
+    let mut watched = false;
+    let mut reseed = false;
     let mut actions = tracker.on_command(first, Instant::now());
     let stop = loop {
         add_said(&mut actions, &tail);
@@ -1885,7 +2166,32 @@ async fn serve(
                 }
                 break Stop::Lost;
             },
-            _ = ticker.tick() => tracker.on_tick(Instant::now(), epoch_ms()),
+            _ = ticker.tick() => {
+                let now = Instant::now();
+                if tracker.logged_in && !watched {
+                    watched = true;
+                    watch = run.first_pairing.then_some(now + PREFS_WATCH);
+                }
+                // A first pairing makes the account's preferences after Soloist has signed in,
+                // too late for it to read ours, so it is started once more, while nothing plays.
+                if let Some(until) = watch
+                    && tracker.status != Status::Playing
+                {
+                    match soloist_prefs::stale(&run.config.data_dir, run.config.prefs) {
+                        // Once for the whole run of the app, whatever the file looks like, so a
+                        // Soloist that never keeps the preferences cannot be started over and over.
+                        true if run.may_retry && !SEEDED.swap(true, Ordering::Relaxed) => {
+                            log::info!("playback: starting soloist again to read its preferences");
+                            reseed = true;
+                            break Stop::Lost;
+                        }
+                        true => watch = None,
+                        false if now >= until => watch = None,
+                        false => {}
+                    }
+                }
+                tracker.on_tick(now, epoch_ms())
+            },
             Some(line) = lines.recv() => tracker.on_line(&line, Instant::now()),
         };
     };
@@ -1923,7 +2229,8 @@ async fn serve(
                 Some(std::time::Instant::now());
         }
     }
-    let retry = match (may_retry, exit) {
+    let retry = match (run.may_retry, exit) {
+        (true, _) if reseed => tracker.retry_order(),
         (true, Some(Some(ORPHANED))) => tracker.retry_order(),
         _ => None,
     };

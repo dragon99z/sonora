@@ -19,6 +19,7 @@ mod radio;
 mod search;
 mod sink;
 mod soloist;
+mod soloist_prefs;
 mod wire;
 
 use std::sync::Arc;
@@ -74,16 +75,18 @@ impl SpotifyProvider {
     }
 
     /// The engine tracks play through, and what it leaves the app to offer. Soloist decodes and
-    /// plays by itself at a quality it chooses, and keeps no downloads for Sonora, so those are
-    /// not offered while it plays. Whether it plays is read again each time an engine starts, so
+    /// plays by itself, at the level written into its preferences, and keeps no downloads for
+    /// Sonora, so those are not offered while it plays. Whether it plays is read again each time an engine starts, so
     /// the settings can change it while the app runs, but what is offered is settled here.
     fn playback(&self, client: &LibrespotClient) -> (Arc<dyn PlaybackFactory>, Capabilities) {
         let runtime = tokio::runtime::Handle::try_current().ok();
         let capabilities = match soloist::current().is_some() && runtime.is_some() {
             true => Capabilities {
                 pins: true,
+                playlist_covers: true,
                 keeps: false,
                 downloads: false,
+                qualities: soloist_prefs::QUALITIES,
                 ..Capabilities::ALL
             },
             false => Capabilities {
